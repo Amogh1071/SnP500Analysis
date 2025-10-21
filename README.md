@@ -105,4 +105,4 @@ MIT License – feel free to use, modify, and distribute.
 
 ## Contact
 
-For questions, open an issue or email [your-email@example.com]. Last updated: October 21, 2025.
+For questions, open an issue or email [amoghs23@iitk.ac.in]. Last updated: October 21, 2025.
