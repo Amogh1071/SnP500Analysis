@@ -1,7 +1,11 @@
 package org.Longshanks;
 
-import java.sql.*;
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.TemporalAdjusters;
 import java.util.*;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -18,11 +22,11 @@ import java.util.stream.Collectors;
  * - Returns: Weighted gross, apply STOP_LOSS_MONTHLY=-0.10, net after TX_COST=0.001 * TURNOVER_EST=0.25.
  * - Outputs monthly strategy returns, interpolated to daily.
  *
- * Dependencies: JDBC for DB read (assumes DataFetcher schema).
- * Utils: DateUtils for monthly resampling, SeriesInterpolator for ffill/shift.
+ * Dependencies: CSV read (assumes wide format from Python: Date,ticker1,ticker2,... with adj_close values).
+ * Utils: getMonthEnd for monthly resampling, SeriesInterpolator for ffill/shift (stubbed).
  *
  * Usage: MomentumStrategy strategy = new MomentumStrategy(configParams);
- *        Map<LocalDate, Double> monthlyReturns = strategy.execute(dbPath);
+ *        Map<LocalDate, Double> monthlyReturns = strategy.execute(csvPath);
  */
 public class MomentumStrategy {
 
@@ -42,6 +46,8 @@ public class MomentumStrategy {
     private final LocalDate START_DATE;
     private final LocalDate END_DATE;
 
+    private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
     public MomentumStrategy(LocalDate startDate, LocalDate endDate) {
         this.START_DATE = startDate;
         this.END_DATE = endDate;
@@ -50,14 +56,14 @@ public class MomentumStrategy {
     /**
      * Executes the strategy backtest.
      *
-     * @param dbPath Path to SQLite DB with prices table.
+     * @param csvPath Path to CSV file with prices (wide format: Date,ticker1,ticker2,...).
      * @return Map<LocalDate, Double> of monthly strategy returns (date -> return).
      */
-    public Map<LocalDate, Double> execute(String dbPath) {
+    public Map<LocalDate, Double> execute(String csvPath) {
         LOGGER.info("Executing Risk-Reduced Momentum Strategy...");
 
         // Step 1: Load and process data
-        Map<LocalDate, Map<String, Double>> monthlyPrices = loadMonthlyPrices(dbPath);
+        Map<LocalDate, Map<String, Double>> monthlyPrices = loadMonthlyPrices(csvPath);
         if (monthlyPrices.isEmpty()) {
             throw new IllegalStateException("No monthly price data loaded.");
         }
@@ -69,47 +75,118 @@ public class MomentumStrategy {
         Map<LocalDate, Map<String, Double>> momSignals = computeMomentumSignals(monthlyPrices);
 
         // Step 4: Run strategy loop (quarterly rebalance)
-        Map<LocalDate, Double> strategyReturnsMonthly = runBacktestLoop(monthlyReturns, momSignals, dbPath);
+        Map<LocalDate, Double> strategyReturnsMonthly = runBacktestLoop(monthlyReturns, momSignals, csvPath);
 
         LOGGER.info("Strategy execution complete. Monthly returns computed: " + strategyReturnsMonthly.size());
         return strategyReturnsMonthly;
     }
 
-    private Map<LocalDate, Map<String, Double>> loadMonthlyPrices(String dbPath) {
-        Map<LocalDate, Map<String, Double>> monthlyPrices = new TreeMap<>();
+    private Map<LocalDate, Map<String, Double>> loadMonthlyPrices(String csvPath) {
+        // Load tickers from header
+        List<String> tickers = new ArrayList<>();
+        Map<LocalDate, Map<String, Double>> dailyPrices = new TreeMap<>();
 
-        String sql = "SELECT date, ticker, adj_close FROM prices " +
-                "WHERE date >= ? AND date <= ? " +
-                "ORDER BY date, ticker";
+        int filteredRows = 0;
+        boolean headerRead = false;
+        try (BufferedReader reader = new BufferedReader(new FileReader(csvPath))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] parts = line.split(",");
+                if (parts.length < 2) continue;
 
-        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+                try {
+                    LocalDate date = LocalDate.parse(parts[0], DATE_FORMATTER);
+                    if (!headerRead) {
+                        // Header: parts[0]="Date", parts[1..] = tickers
+                        for (int i = 1; i < parts.length; i++) {
+                            tickers.add(parts[i].trim());
+                        }
+                        headerRead = true;
+                        LOGGER.info("Loaded " + tickers.size() + " tickers from header.");
+                        continue;
+                    }
 
-            pstmt.setString(1, START_DATE.toString());
-            pstmt.setString(2, END_DATE.toString());
+                    if (date.isBefore(START_DATE) || date.isAfter(END_DATE)) continue;
 
-            try (ResultSet rs = pstmt.executeQuery()) {
-                while (rs.next()) {
-                    LocalDate date = LocalDate.parse(rs.getString("date"));
-                    String ticker = rs.getString("ticker");
-                    double price = rs.getDouble("adj_close");
-
-                    // Resample to month-end: Use last price of each month
-                    LocalDate monthEnd = DateUtils.getMonthEnd(date);
-                    monthlyPrices.computeIfAbsent(monthEnd, k -> new HashMap<>()).put(ticker, price);
+                    Map<String, Double> dayPrices = new HashMap<>();
+                    boolean hasValid = false;
+                    for (int i = 1; i < parts.length; i++) {
+                        if (i - 1 < tickers.size()) {
+                            String ticker = tickers.get(i - 1);
+                            double price = Double.parseDouble(parts[i]);
+                            if (price > 0) {
+                                dayPrices.put(ticker, price);
+                                hasValid = true;
+                            }
+                        }
+                    }
+                    if (hasValid) {
+                        dailyPrices.put(date, dayPrices);
+                        filteredRows++;
+                    }
+                } catch (Exception e) {
+                    // Skip invalid rows
+                    LOGGER.fine("Skipped invalid row: " + line);
                 }
             }
-
-            // Clean: Drop tickers with <80% data
-            monthlyPrices = cleanData(monthlyPrices);
-
-        } catch (SQLException e) {
-            LOGGER.severe("DB load error: " + e.getMessage());
+        } catch (IOException e) {
+            LOGGER.severe("CSV load error: " + e.getMessage());
             return new HashMap<>();
         }
 
-        LOGGER.info("Loaded monthly prices for " + monthlyPrices.size() + " dates.");
+        LOGGER.info("Filtered " + filteredRows + " daily rows post-" + START_DATE + " with valid prices.");
+
+        if (dailyPrices.isEmpty()) {
+            LOGGER.warning("No daily data post-" + START_DATE + ". Check CSV content.");
+            return new HashMap<>();
+        }
+
+        // Now resample to month-end: for each month, take prices from the last trading day
+        Map<LocalDate, Map<String, Double>> monthlyPrices = new TreeMap<>();
+        Map<String, Double> currentMonthPrices = new HashMap<>();
+        LocalDate currentMonth = null;
+
+        for (Map.Entry<LocalDate, Map<String, Double>> entry : dailyPrices.entrySet()) {
+            LocalDate date = entry.getKey();
+            LocalDate monthEnd = getMonthEnd(date);
+
+            if (!monthEnd.equals(currentMonth)) {
+                // Save previous month
+                if (currentMonth != null && !currentMonthPrices.isEmpty()) {
+                    monthlyPrices.put(currentMonth, new HashMap<>(currentMonthPrices));
+                }
+                // Start new month
+                currentMonth = monthEnd;
+                currentMonthPrices = new HashMap<>();
+            }
+
+            // Add/overwrite with this day's prices (later days overwrite earlier)
+            Map<String, Double> dayPrices = entry.getValue();
+            currentMonthPrices.putAll(dayPrices);
+        }
+
+        // Save last month
+        if (currentMonth != null && !currentMonthPrices.isEmpty()) {
+            monthlyPrices.put(currentMonth, new HashMap<>(currentMonthPrices));
+        }
+
+        // Clean: Drop tickers with <80% data (mimics Python dropna(thresh=0.8*len(prices)))
+        monthlyPrices = cleanData(monthlyPrices);
+
+        LOGGER.info("Loaded monthly prices for " + monthlyPrices.size() + " dates across " + getTotalTickers(monthlyPrices) + " tickers.");
         return monthlyPrices;
+    }
+
+    private int getTotalTickers(Map<LocalDate, Map<String, Double>> data) {
+        Set<String> tickers = new HashSet<>();
+        for (Map<String, Double> prices : data.values()) {
+            tickers.addAll(prices.keySet());
+        }
+        return tickers.size();
+    }
+
+    private LocalDate getMonthEnd(LocalDate date) {
+        return date.with(TemporalAdjusters.lastDayOfMonth());
     }
 
     private Map<LocalDate, Map<String, Double>> cleanData(Map<LocalDate, Map<String, Double>> data) {
@@ -135,6 +212,7 @@ public class MomentumStrategy {
                 for (Map<String, Double> prices : data.values()) {
                     prices.remove(ticker);
                 }
+                LOGGER.fine("Dropped ticker " + ticker + " (<80% coverage: " + count + "/" + data.size() + ")");
             }
         }
 
@@ -259,7 +337,7 @@ public class MomentumStrategy {
     }
 
     private Map<LocalDate, Double> runBacktestLoop(Map<LocalDate, Map<String, Double>> monthlyReturns,
-                                                   Map<LocalDate, Map<String, Double>> momSignals, String dbPath) {
+                                                   Map<LocalDate, Map<String, Double>> momSignals, String csvPath) {
         Map<LocalDate, Double> strategyReturns = new TreeMap<>();
         List<LocalDate> dates = new ArrayList<>(momSignals.keySet());
 
@@ -291,7 +369,7 @@ public class MomentumStrategy {
             if (longStocks.isEmpty()) continue;
 
             // Compute vol-scaled weights: Use daily returns for 252-day ann. vol (more accurate)
-            Map<String, Double> vols = computeDailyAnnualizedVol(dbPath, date, longStocks);
+            Map<String, Double> vols = computeDailyAnnualizedVol(csvPath, date, longStocks);
             Map<String, Double> weights = computeInverseVolWeights(vols, POS_CAP);
 
             // Gross monthly return (weighted)
@@ -315,68 +393,87 @@ public class MomentumStrategy {
         return strategyReturns;
     }
 
-    private Map<String, Double> computeDailyAnnualizedVol(String dbPath, LocalDate endDate, List<String> tickers) {
+    private Map<String, Double> computeDailyAnnualizedVol(String csvPath, LocalDate endDate, List<String> tickers) {
         Map<String, Double> vols = new HashMap<>();
         LocalDate startVol = endDate.minusDays(300); // Buffer for 252 trading days
 
-        String sql = "SELECT date, ticker, adj_close FROM prices " +
-                "WHERE date >= ? AND date <= ? AND ticker IN (" +
-                String.join(",", Collections.nCopies(tickers.size(), "?")) + ") " +
-                "ORDER BY ticker, date";
+        // Load tickers from header (assume consistent)
+        List<String> allTickers = new ArrayList<>();
+        Map<String, TreeMap<LocalDate, Double>> tickerDailyPrices = new HashMap<>();
+        Set<String> tickerSet = new HashSet<>(tickers);
+        boolean headerRead = false;
+        try (BufferedReader reader = new BufferedReader(new FileReader(csvPath))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] parts = line.split(",");
+                if (parts.length < 2) continue;
 
-        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-
-            pstmt.setString(1, startVol.toString());
-            pstmt.setString(2, endDate.toString());
-            for (int i = 0; i < tickers.size(); i++) {
-                pstmt.setString(3 + i, tickers.get(i));
-            }
-
-            try (ResultSet rs = pstmt.executeQuery()) {
-                Map<String, List<Double>> dailyLogRets = new HashMap<>();
-                for (String ticker : tickers) {
-                    dailyLogRets.put(ticker, new ArrayList<>());
-                }
-
-                String prevTicker = null;
-                Double prevPrice = null;
-                while (rs.next()) {
-                    String ticker = rs.getString("ticker");
-                    LocalDate date = LocalDate.parse(rs.getString("date"));
-                    double price = rs.getDouble("adj_close");
-
-                    if (!ticker.equals(prevTicker)) {
-                        prevTicker = ticker;
-                        prevPrice = null; // Reset for new ticker
+                try {
+                    LocalDate date = LocalDate.parse(parts[0], DATE_FORMATTER);
+                    if (!headerRead) {
+                        for (int i = 1; i < parts.length; i++) {
+                            allTickers.add(parts[i].trim());
+                        }
+                        headerRead = true;
                         continue;
                     }
 
-                    if (prevPrice != null && prevPrice > 0) {
-                        double logRet = Math.log(price / prevPrice);
-                        dailyLogRets.get(ticker).add(logRet);
-                    }
-                    prevPrice = price;
-                }
+                    if (date.isBefore(startVol) || date.isAfter(endDate)) continue;
 
-                // Compute std dev over ~252 days, annualize
-                for (Map.Entry<String, List<Double>> entry : dailyLogRets.entrySet()) {
-                    List<Double> rets = entry.getValue();
-                    if (rets.size() < 30) { // Min for vol est.
-                        vols.put(entry.getKey(), 0.2); // Default
-                        continue;
+                    for (int i = 1; i < parts.length; i++) {
+                        if (i - 1 < allTickers.size()) {
+                            String ticker = allTickers.get(i - 1);
+                            if (tickerSet.contains(ticker)) {
+                                double price = Double.parseDouble(parts[i]);
+                                if (price > 0) {
+                                    tickerDailyPrices.computeIfAbsent(ticker, k -> new TreeMap<>()).put(date, price);
+                                }
+                            }
+                        }
                     }
-                    double sum = rets.stream().mapToDouble(Double::doubleValue).sum();
-                    double mean = sum / rets.size();
-                    double variance = rets.stream().mapToDouble(r -> Math.pow(r - mean, 2)).sum() / (rets.size() - 1);
-                    double std = Math.sqrt(variance);
-                    double annVol = std * Math.sqrt(252);
-                    vols.put(entry.getKey(), annVol > 0 ? annVol : 0.2);
+                } catch (Exception ignored) {
+                    // Skip
                 }
             }
-        } catch (SQLException e) {
-            LOGGER.warning("Vol calc error: " + e.getMessage() + ". Using default vols.");
+        } catch (IOException e) {
+            LOGGER.warning("CSV vol calc error: " + e.getMessage() + ". Using default vols.");
             tickers.forEach(t -> vols.put(t, 0.2));
+            return vols;
+        }
+
+        // Compute log returns per ticker using sorted dates
+        for (String ticker : tickers) {
+            TreeMap<LocalDate, Double> prices = tickerDailyPrices.get(ticker);
+            if (prices == null || prices.size() < 2) {
+                vols.put(ticker, 0.2); // Default
+                continue;
+            }
+
+            List<Double> rets = new ArrayList<>();
+            Iterator<Map.Entry<LocalDate, Double>> it = prices.entrySet().iterator();
+            Map.Entry<LocalDate, Double> prevEntry = it.next();
+            Double prevPrice = prevEntry.getValue();
+
+            while (it.hasNext()) {
+                Map.Entry<LocalDate, Double> entry = it.next();
+                Double currPrice = entry.getValue();
+                if (prevPrice > 0 && currPrice > 0) {
+                    rets.add(Math.log(currPrice / prevPrice));
+                }
+                prevPrice = currPrice;
+            }
+
+            if (rets.size() < 30) { // Min for vol est.
+                vols.put(ticker, 0.2);
+                continue;
+            }
+
+            double sum = rets.stream().mapToDouble(Double::doubleValue).sum();
+            double mean = sum / rets.size();
+            double variance = rets.stream().mapToDouble(r -> Math.pow(r - mean, 2)).sum() / (rets.size() - 1);
+            double std = Math.sqrt(variance);
+            double annVol = std * Math.sqrt(252);
+            vols.put(ticker, annVol > 0 ? annVol : 0.2);
         }
 
         return vols;
@@ -403,7 +500,19 @@ public class MomentumStrategy {
     }
 
     // Additional method to interpolate monthly to daily (called externally, e.g., in Metrics)
+    // Stub: Simple ffill (implement SeriesInterpolator if needed)
     public Map<LocalDate, Double> interpolateToDaily(Map<LocalDate, Double> monthlyReturns, LocalDate start, LocalDate end) {
-        return SeriesInterpolator.ffillAndShift(monthlyReturns, start, end);
+        Map<LocalDate, Double> daily = new TreeMap<>();
+        LocalDate lastDate = null;
+        Double lastRet = 0.0; // Assume 0 for missing
+
+        for (LocalDate date = start; !date.isAfter(end); date = date.plusDays(1)) {
+            if (monthlyReturns.containsKey(date)) {
+                lastRet = monthlyReturns.get(date);
+                lastDate = date;
+            }
+            daily.put(date, lastRet);
+        }
+        return daily;
     }
 }

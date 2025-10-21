@@ -1,10 +1,10 @@
 package org.Longshanks;
 
-import org.Longshanks.MomentumStrategy;
-import org.Longshanks.SeriesInterpolator;
-
-import java.sql.*;
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -23,7 +23,7 @@ import java.util.stream.Collectors;
  * Benchmark: Equal-weight market (mean daily log returns across stocks).
  *
  * Usage: MetricsCalculator calc = new MetricsCalculator(rf, start, end);
- *        MetricsReport report = calc.compute(strategyMonthlyReturns, dbPath);
+ *        MetricsReport report = calc.compute(strategyMonthlyReturns, csvPath);
  *        MetricsReporter.print(report);
  */
 public class MetricsCalculator {
@@ -35,6 +35,8 @@ public class MetricsCalculator {
     private final LocalDate startDate;
     private final LocalDate endDate;
 
+    private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
     public MetricsCalculator(double rf, LocalDate start, LocalDate end) {
         this.riskFreeRate = rf;
         this.startDate = start;
@@ -45,17 +47,17 @@ public class MetricsCalculator {
      * Computes metrics for strategy and benchmark.
      *
      * @param strategyMonthlyReturns Monthly strategy returns from MomentumStrategy.
-     * @param dbPath Path to prices DB.
+     * @param csvPath Path to prices CSV (wide format).
      * @return MetricsReport with strategy and benchmark metrics.
      */
-    public MetricsReport compute(Map<LocalDate, Double> strategyMonthlyReturns, String dbPath) {
+    public MetricsReport compute(Map<LocalDate, Double> strategyMonthlyReturns, String csvPath) {
         LOGGER.info("Computing performance metrics...");
 
         // Interpolate strategy to daily
         Map<LocalDate, Double> strategyDailyReturns = interpolateStrategyReturns(strategyMonthlyReturns);
 
         // Compute benchmark daily returns (equal-weight)
-        Map<LocalDate, Double> benchmarkDailyReturns = computeBenchmarkReturns(dbPath);
+        Map<LocalDate, Double> benchmarkDailyReturns = computeBenchmarkReturns(csvPath);
 
         // Align dates (intersection)
         Set<LocalDate> commonDates = new HashSet<>(strategyDailyReturns.keySet());
@@ -81,70 +83,106 @@ public class MetricsCalculator {
     }
 
     private Map<LocalDate, Double> interpolateStrategyReturns(Map<LocalDate, Double> monthlyReturns) {
-        // Use shared interpolator (assumes MomentumStrategy has it public/static or copy logic)
-        return SeriesInterpolator.ffillAndShift(monthlyReturns, startDate, endDate);
+        // Stub for SeriesInterpolator: ffill monthly returns to daily (uniform per period)
+        Map<LocalDate, Double> dailyReturns = new TreeMap<>();
+        Double lastRet = 0.0;
+        LocalDate lastMonthEnd = null;
+
+        for (LocalDate date = startDate; !date.isAfter(endDate); date = date.plusDays(1)) {
+            if (monthlyReturns.containsKey(date)) {
+                lastRet = monthlyReturns.get(date);
+                lastMonthEnd = date;
+            }
+            if (lastMonthEnd != null) {
+                dailyReturns.put(date, lastRet);
+            }
+        }
+        return dailyReturns;
     }
 
-    private Map<LocalDate, Double> computeBenchmarkReturns(String dbPath) {
+    private Map<LocalDate, Double> computeBenchmarkReturns(String csvPath) {
         Map<LocalDate, Double> dailyReturns = new TreeMap<>();
 
-        String sql = "SELECT date, ticker, adj_close FROM prices " +
-                "WHERE date >= ? AND date <= ? " +
-                "ORDER BY date, ticker";
+        // Load tickers from header
+        List<String> tickers = new ArrayList<>();
+        boolean headerRead = false;
+        Map<LocalDate, Map<String, Double>> dailyPrices = new TreeMap<>();
 
-        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(csvPath))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] parts = line.split(",");
+                if (parts.length < 2) continue;
 
-            pstmt.setString(1, startDate.toString());
-            pstmt.setString(2, endDate.toString());
+                try {
+                    LocalDate date = LocalDate.parse(parts[0], DATE_FORMATTER);
+                    if (date.isBefore(startDate) || date.isAfter(endDate)) continue;
 
-            try (ResultSet rs = pstmt.executeQuery()) {
-                Map<LocalDate, Map<String, Double>> dailyPrices = new TreeMap<>();
+                    if (!headerRead) {
+                        for (int i = 1; i < parts.length; i++) {
+                            tickers.add(parts[i].trim());
+                        }
+                        headerRead = true;
+                        continue;
+                    }
 
-                while (rs.next()) {
-                    LocalDate date = LocalDate.parse(rs.getString("date"));
-                    String ticker = rs.getString("ticker");
-                    double price = rs.getDouble("adj_close");
-
-                    dailyPrices.computeIfAbsent(date, k -> new HashMap<>()).put(ticker, price);
-                }
-
-                // Compute daily log returns per stock, then equal-weight mean
-                Iterator<LocalDate> it = dailyPrices.keySet().iterator();
-                if (!it.hasNext()) return dailyReturns;
-
-                LocalDate prevDate = it.next();
-                Map<String, Double> prevPrices = dailyPrices.get(prevDate);
-
-                while (it.hasNext()) {
-                    LocalDate date = it.next();
-                    Map<String, Double> currPrices = dailyPrices.get(date);
-
-                    double totalLogRet = 0.0;
-                    int validStocks = 0;
-
-                    Set<String> allTickers = new HashSet<>(prevPrices.keySet());
-                    allTickers.retainAll(currPrices.keySet());
-
-                    for (String ticker : allTickers) {
-                        Double currPrice = currPrices.get(ticker);
-                        Double prevPrice = prevPrices.get(ticker);
-                        if (currPrice != null && prevPrice != null && prevPrice > 0) {
-                            totalLogRet += Math.log(currPrice / prevPrice);
-                            validStocks++;
+                    Map<String, Double> dayPrices = new HashMap<>();
+                    for (int i = 1; i < parts.length; i++) {
+                        if (i - 1 < tickers.size()) {
+                            try {
+                                double price = Double.parseDouble(parts[i]);
+                                if (price > 0) {
+                                    dayPrices.put(tickers.get(i - 1), price);
+                                }
+                            } catch (NumberFormatException ignored) {
+                                // Skip invalid
+                            }
                         }
                     }
-
-                    if (validStocks > 0) {
-                        dailyReturns.put(date, totalLogRet / validStocks);
+                    if (!dayPrices.isEmpty()) {
+                        dailyPrices.put(date, dayPrices);
                     }
+                } catch (Exception e) {
+                    // Skip invalid rows
+                    LOGGER.fine("Skipped invalid row: " + line);
+                }
+            }
+        } catch (IOException e) {
+            LOGGER.severe("CSV benchmark error: " + e.getMessage());
+            return dailyReturns;
+        }
 
-                    prevPrices = currPrices;
+        // Compute daily log returns per stock, then equal-weight mean
+        Iterator<LocalDate> it = dailyPrices.keySet().iterator();
+        if (!it.hasNext()) return dailyReturns;
+
+        LocalDate prevDate = it.next();
+        Map<String, Double> prevPrices = dailyPrices.get(prevDate);
+
+        while (it.hasNext()) {
+            LocalDate date = it.next();
+            Map<String, Double> currPrices = dailyPrices.get(date);
+
+            double totalLogRet = 0.0;
+            int validStocks = 0;
+
+            Set<String> allTickers = new HashSet<>(prevPrices.keySet());
+            allTickers.retainAll(currPrices.keySet());
+
+            for (String ticker : allTickers) {
+                Double currPrice = currPrices.get(ticker);
+                Double prevPrice = prevPrices.get(ticker);
+                if (currPrice != null && prevPrice != null && prevPrice > 0) {
+                    totalLogRet += Math.log(currPrice / prevPrice);
+                    validStocks++;
                 }
             }
 
-        } catch (SQLException e) {
-            LOGGER.severe("Benchmark computation error: " + e.getMessage());
+            if (validStocks > 0) {
+                dailyReturns.put(date, totalLogRet / validStocks);
+            }
+
+            prevPrices = currPrices;
         }
 
         LOGGER.info("Benchmark daily returns: " + dailyReturns.size() + " dates.");
@@ -165,30 +203,28 @@ public class MetricsCalculator {
         double sharpe = annVol > 0 ? (annReturn - riskFreeRate) / annVol : 0.0;
 
         // Cumulative returns for DD
-        List<Double> cumRets = new ArrayList<>();
-        double cum = 1.0;
-        for (double r : returns) {
-            cum *= (1 + r);
-            cumRets.add(cum - 1); // Simple return for DD
-        }
-
-        double maxCum = cumRets.stream().mapToDouble(Double::doubleValue).max().orElse(0.0);
+        double cumProd = 1.0;
+        double maxCumProd = 1.0;
         double maxDd = 0.0;
-        double peak = 0.0;
-        for (double cr : cumRets) {
-            if (cr > peak) peak = cr;
-            double dd = (cr - peak) / (peak + 1); // Normalized DD
-            if (dd < maxDd) maxDd = dd;
+        for (double r : returns) {
+            cumProd *= (1 + r);
+            if (cumProd > maxCumProd) {
+                maxCumProd = cumProd;
+            }
+            double dd = (cumProd / maxCumProd) - 1;
+            if (dd < maxDd) {
+                maxDd = dd;
+            }
         }
 
         // Sortino
         List<Double> downside = returns.stream().filter(r -> r < 0).collect(Collectors.toList());
-        double downsideStd = downside.isEmpty() ? 0.0 : stdDev(downside);
-        double annDownside = downsideStd * Math.sqrt(FREQ);
-        double sortino = annDownside > 0 ? (annReturn - riskFreeRate) / annDownside : 0.0;
+        double downsideStdDaily = downside.isEmpty() ? 0.0 : stdDev(downside);
+        double annDownsideStd = downsideStdDaily * Math.sqrt(FREQ);
+        double sortino = annDownsideStd > 0 ? (annReturn - riskFreeRate) / annDownsideStd : 0.0;
 
         // Calmar
-        double calmar = maxDd != 0 ? annReturn / Math.abs(maxDd) : 0.0;
+        double calmar = Math.abs(maxDd) > 0 ? annReturn / Math.abs(maxDd) : 0.0;
 
         Map<String, Double> metrics = new HashMap<>();
         metrics.put("Ann Return", annReturn);
